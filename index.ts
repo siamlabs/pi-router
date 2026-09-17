@@ -1,0 +1,627 @@
+/**
+ * pi-router — Automatic model routing for Pi
+ *
+ * Exposes three routing modes through Pi's existing `/model` selector:
+ *
+ *   AUTO   -> Pi decides between LOCAL and a REMOTE model, per turn, based on the task
+ *   LOCAL  -> force provider=local  model=model  (a local llama.cpp server)
+ *   REMOTE -> force provider=openai model=<your remote model>
+ *
+ * NOTE: this is a generic template. Before using it, set the REMOTE model name
+ * and the local server endpoint in the CONSTANTS block below (search for
+ * "CHANGE_ME").
+ *
+ * Routing happens entirely at the Pi extension layer. Pi's `/model` selector is
+ * never replaced or hidden. AUTO is represented as a *virtual* model registered
+ * through the supported `registerProvider()` API so that it shows up as a normal
+ * entry in the existing selector (sorted first, because "auto-router" sorts
+ * before "local"/"openai"). Selecting AUTO, LOCAL or ASTRA in the selector, or
+ * via the `/auto` `/local` `/astra` slash commands, drives the same state.
+ */
+
+import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionCommandContext,
+  ModelSelectEvent,
+  ToolExecutionEndEvent,
+  TurnStartEvent,
+  InputEvent,
+} from "@earendil-works/pi-coding-agent";
+
+/* =========================================================
+   CONSTANTS
+========================================================= */
+
+const PROVIDER_LOCAL = "local";
+const MODEL_LOCAL = "model";
+const PROVIDER_ASTRA = "openai";
+// CHANGE_ME: your OpenAI-compatible remote model. Replace with a model you have
+// configured in Pi (e.g. "gpt-4o"). This is the only per-user value that matters.
+const MODEL_ASTRA = "gpt-4o";
+
+// Virtual provider/model that stands in for the AUTO option inside the selector.
+const PROVIDER_AUTO = "auto-router";
+const MODEL_AUTO = "auto-router";
+
+// Custom-entry types persisted into the session file (not sent to the LLM).
+const STATE_CUSTOM_TYPE = "router-state";
+const DISPLAY_CUSTOM_TYPE = "router-status";
+
+type Mode = "auto" | "local" | "astra";
+type Target = "local" | "astra" | null;
+
+interface RouterState {
+  mode: Mode;
+  currentTarget: Target;
+  consecutiveFailures: number;
+  totalDecisions: number;
+  totalSwitches: number;
+  totalFailures: number;
+  lastDecision: string;
+  lastDecisionReason: string;
+  history: Array<{ ts: string; from: Target; to: Target; reason: string }>;
+}
+
+const DEFAULT_STATE: RouterState = {
+  mode: "auto",
+  currentTarget: null,
+  consecutiveFailures: 0,
+  totalDecisions: 0,
+  totalSwitches: 0,
+  totalFailures: 0,
+  lastDecision: "",
+  lastDecisionReason: "",
+  history: [],
+};
+
+/* =========================================================
+   PATHS
+========================================================= */
+
+const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+
+/* =========================================================
+   STATE
+========================================================= */
+
+// In-memory state is the source of truth for the live session.
+let state: RouterState = { ...DEFAULT_STATE };
+// Guards against re-entrancy: when we programmatically switch the model via
+// setModel(), Pi emits a "set" model_select that we must not treat as a manual
+// user selection.
+let applyingRouterModel = false;
+// Whether the AUTO target has already been decided for the current turn. Reset
+// at turn_start so each new turn re-decides. currentTarget itself persists
+// across turns and is used as the escalation baseline.
+let decidedThisTurn = false;
+// Captured task text, used to drive AUTO decisions at the turn boundary when
+// the input event fired while the agent was busy (so we cannot switch then).
+let pendingInputText = "";
+
+function cloneState(): RouterState {
+  return {
+    ...state,
+    history: state.history.map((h) => ({ ...h })),
+  };
+}
+
+function persistState(): void {
+  try {
+    // appendEntry writes a custom entry into the session file so routing state
+    // survives compaction/rollback. It is never sent to the LLM.
+    (pi as unknown as {
+      appendEntry: (customType: string, data?: unknown) => void;
+    }).appendEntry(STATE_CUSTOM_TYPE, cloneState());
+  } catch {
+    /* non-critical */
+  }
+}
+
+function recordSwitch(from: Target, to: Target, reason: string): void {
+  const ts = new Date().toISOString();
+  state.totalSwitches += 1;
+  state.history.push({ ts, from, to, reason });
+  if (state.history.length > 50) state.history.shift();
+  persistState();
+}
+
+/* =========================================================
+   PROVIDER / MODEL LOOKUPS
+========================================================= */
+
+// Resolve the FULLY-CONFIGURED model from Pi's registry so that `api`,
+// `baseUrl`, headers, and every other piece of provider configuration are
+// preserved when passed to `pi.setModel()`.
+//
+// WHY THIS MATTERS: `pi.setModel(model)` stores the passed object *verbatim*
+// as `agent.state.model`. If we pass a bare `{ provider, id }` reference, its
+// `api` field is `undefined`, so the subsequent provider request resolves with
+// `api: undefined` -> "No API provider registered for api: undefined".
+//
+// The normal Pi `/model` selector works with `local/model` precisely because it
+// passes the *fully-resolved* registry model (which always carries an `api`).
+// `ctx.modelRegistry.find(provider, id)` is the supported lookup that returns a
+// complete `Model`, so we use it instead of constructing a minimal reference.
+function targetModel(ctx: ExtensionContext, target: Target): ReturnType<
+  typeof ctx.modelRegistry.find
+> {
+  const provider = target === "astra" ? PROVIDER_ASTRA : PROVIDER_LOCAL;
+  const id = target === "astra" ? MODEL_ASTRA : MODEL_LOCAL;
+
+  const resolved = ctx.modelRegistry.find(provider, id);
+  if (resolved) return resolved;
+
+  // Fallback: minimal reference; setModel's own auth validation will fail
+  // loudly with "No API key" rather than silently producing `api: undefined`.
+  return { provider, id } as unknown as ReturnType<typeof ctx.modelRegistry.find>;
+}
+
+// Whether a target provider is configured with auth (so setModel won't throw
+// "No API key"). Defensive: if the registry API is unavailable, assume it is
+// configured and let setModel's own validation decide.
+function isTargetAvailable(ctx: ExtensionContext, target: Target): boolean {
+  try {
+    const reg = (ctx as unknown as {
+      modelRegistry?: { hasConfiguredAuth?: (m: { provider: string }) => boolean };
+    }).modelRegistry;
+    if (reg?.hasConfiguredAuth) {
+      return reg.hasConfiguredAuth(targetModel(ctx, target));
+    }
+  } catch {
+    /* fall through */
+  }
+  return true;
+}
+
+/* =========================================================
+   TASK CLASSIFICATION (AUTO policy)
+========================================================= */
+
+// Signals that the task is a deep, cross-cutting "thinking" concern that the
+// local model is typically weaker at, and that a remote reasoning model handles
+// better.
+const ARCHITECTURE_HINTS = [
+  "architecture",
+  "architect",
+  "design",
+  "designs",
+  "refactor",
+  "scal",
+  "performance",
+  "trade",
+  "tradeoff",
+  "tradeoffs",
+  "pattern",
+  "patterns",
+  "system design",
+  "data model",
+  "schema",
+  "overview",
+  "high-level",
+  "high level",
+  "roadmap",
+  "plan the",
+  "how should we",
+  "evaluate",
+  "compare",
+];
+
+// Signals that the task is a concrete, self-contained implementation step that
+// the local model is typically good at.
+const IMPLEMENTATION_HINTS = [
+  "implement",
+  "write a ",
+  "write the ",
+  "fix ",
+  "add a ",
+  "add the ",
+  "build a ",
+  "build the ",
+  "test",
+  "tests",
+  "bug",
+  "bugs",
+  "run the",
+  "run a ",
+  "execute",
+  "small",
+  "quick",
+  "update the ",
+  "update a ",
+];
+
+function classifyTask(text: string): {
+  score: number;
+  architecture: number;
+  implementation: number;
+} {
+  const lower = ` ${text.toLowerCase()} `;
+  let architecture = 0;
+  let implementation = 0;
+  for (const h of ARCHITECTURE_HINTS) if (lower.includes(` ${h} `)) architecture += 1;
+  for (const h of IMPLEMENTATION_HINTS) if (lower.includes(` ${h} `)) implementation += 1;
+  return { score: architecture - implementation, architecture, implementation };
+}
+
+/**
+ * AUTO policy: pick the target model for this turn.
+ *
+ * 1. If the previous turn failed (tool error) we escalate away from the model
+ *    that just failed, unless it already succeeded at least once.
+ * 2. Otherwise classify the incoming task text and route accordingly.
+ * 3. Ties / no signal fall back to the previous target, else local.
+ */
+function decideTarget(
+  text: string,
+  prevTarget: Target
+): { target: Target; reason: string } {
+  // 1. Escalate on failure: switch away from the model that just failed.
+  if (state.consecutiveFailures >= 2) {
+    const next =
+      prevTarget === "local"
+        ? "astra"
+        : prevTarget === "astra"
+          ? "local"
+          : "local";
+    const failures = state.consecutiveFailures;
+    state.consecutiveFailures = 0;
+    return {
+      target: next,
+      reason: `escalated after ${failures} consecutive tool failures`,
+    };
+  }
+
+  const { score } = classifyTask(text);
+
+  // 2. Clear signal.
+  if (score >= 1) return { target: "astra", reason: "architecture/design signals" };
+  if (score <= -1) return { target: "local", reason: "implementation signals" };
+
+  // 3. No signal: keep prior target; else prefer local.
+  if (prevTarget) return { target: prevTarget, reason: "no signal; kept prior target" };
+  return { target: "local", reason: "no signal; default local" };
+}
+
+/* =========================================================
+   ROUTING ACTIONS
+========================================================= */
+
+function setMode(mode: Mode): void {
+  const was = state.mode;
+  state.mode = mode;
+  if (mode === "auto") state.currentTarget = null;
+  state.lastDecisionReason = `mode set to ${mode}`;
+  if (was !== mode) persistState();
+}
+
+/**
+ * Apply a routing decision by switching the active model through Pi's own
+ * setModel(). We defer with setTimeout(0) so it runs *after* the current
+ * model_select "set" event has fully unwound, then mark the guard so the
+ * resulting "set" event is ignored.
+ */
+function applyTarget(
+  ctx: ExtensionContext,
+  target: Target,
+  reason: string
+): void {
+  if (!target) return;
+
+  applyingRouterModel = true;
+  const prev = state.currentTarget;
+  (pi as unknown as {
+    setModel: (m: unknown) => Promise<boolean>;
+  }).setModel(targetModel(ctx, target)).catch(() => {
+    state.lastDecisionReason = `cannot switch to ${target}: provider not configured`;
+  });
+
+  state.currentTarget = target;
+  state.lastDecision = target;
+  state.lastDecisionReason = reason;
+  state.totalDecisions += 1;
+  state.consecutiveFailures = 0;
+  recordSwitch(prev, target, reason);
+
+  // Release the guard once the deferred setModel has been scheduled.
+  setTimeout(() => {
+    applyingRouterModel = false;
+  }, 0);
+}
+
+/* =========================================================
+   SESSION-FILE STATE RESTORE
+========================================================= */
+
+function restoreStateFromSession(ctx: ExtensionContext): void {
+  try {
+    // `ctx.sessionManager.getSessionDir()` is the supported (typed) way to reach
+    // the session directory; `ctx.sessionDir` is not exposed on the type.
+    const dir = ctx.sessionManager.getSessionDir();
+    if (!dir || !existsSync(dir)) return;
+    const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+    let restored: RouterState | null = null;
+    for (const file of files) {
+      const lines = readFileSync(join(dir, file), "utf-8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      for (const line of lines) {
+        const entry = JSON.parse(line);
+        if (entry?.type === "custom" && entry?.customType === STATE_CUSTOM_TYPE) {
+          restored = entry.data;
+        }
+      }
+    }
+    if (restored && typeof restored.mode === "string") {
+      state = { ...DEFAULT_STATE, ...restored };
+    }
+  } catch {
+    /* start from defaults */
+  }
+}
+
+/* =========================================================
+   STATUS DISPLAY
+========================================================= */
+
+function describeTarget(t: Target): string {
+  return t === "local" ? "LOCAL" : t === "astra" ? "ASTRA" : "—";
+}
+
+function buildStatusLine(): string {
+  const mode = state.mode.toUpperCase();
+  const target = describeTarget(state.currentTarget);
+  return (
+    `Router: **${mode}** → ${target}  ` +
+    `(decisions ${state.totalDecisions}, switches ${state.totalSwitches}, ` +
+    `failures ${state.totalFailures}, last: ${state.lastDecision || "none"} ` +
+    `${state.lastDecisionReason || ""})`
+  );
+}
+
+function showStatus(ctx: ExtensionContext): void {
+  try {
+    (pi as unknown as {
+      sendMessage: (msg: unknown) => void;
+    }).sendMessage({
+      customType: DISPLAY_CUSTOM_TYPE,
+      content: buildStatusLine(),
+      display: true,
+      details: cloneState(),
+    });
+  } catch {
+    /* non-critical */
+  }
+}
+
+/* =========================================================
+   EVENT HANDLERS
+========================================================= */
+
+// User (or command) selected a model from the selector.
+function handleModelSelect(event: ModelSelectEvent, ctx: ExtensionContext): void {
+  const { model } = event;
+
+  // Ignore switches we initiated ourselves.
+  if (applyingRouterModel) return;
+
+  // AUTO chosen in the selector.
+  if (model.provider === PROVIDER_AUTO && model.id === MODEL_AUTO) {
+    setMode("auto");
+    state.lastDecisionReason = "user selected AUTO";
+    persistState();
+    // Decide + switch on the next turn boundary instead of interrupting the
+    // selector flow.
+    return;
+  }
+
+  // Explicit LOCAL force.
+  if (model.provider === PROVIDER_LOCAL && model.id === MODEL_LOCAL) {
+    setMode("local");
+    state.currentTarget = "local";
+    state.lastDecision = "local";
+    state.lastDecisionReason = "user forced LOCAL";
+    persistState();
+    return;
+  }
+
+  // Explicit ASTRA force.
+  if (model.provider === PROVIDER_ASTRA && model.id === MODEL_ASTRA) {
+    setMode("astra");
+    state.currentTarget = "astra";
+    state.lastDecision = "astra";
+    state.lastDecisionReason = "user forced ASTRA";
+    persistState();
+    return;
+  }
+
+  // Any other manual selection: leave routing untouched.
+}
+
+// Turn boundary: reset the per-turn decision flag so the next input re-decides,
+// and drive the decision if the input event fired while the agent was busy
+// (so the switch lands before the first provider request of the turn).
+function handleTurnStart(_event: TurnStartEvent, ctx: ExtensionContext): void {
+  decidedThisTurn = false;
+  if (state.mode !== "auto") return;
+  if (decidedThisTurn) return;
+  if (!pendingInputText && state.currentTarget) return; // already decided
+  const { target, reason } = decideTarget(pendingInputText, state.currentTarget);
+  pendingInputText = "";
+  decidedThisTurn = true;
+  applyTarget(ctx, target, reason);
+}
+
+// User submitted input. This is where we have the task text, so for AUTO mode
+// we decide + switch here if the agent is idle (so the switch is not torn down
+// mid-stream).
+function handleInput(event: InputEvent, ctx: ExtensionContext): void {
+  if (state.mode !== "auto") return;
+  if (decidedThisTurn) return; // already decided for this turn
+
+  if (ctx.isIdle()) {
+    const { target, reason } = decideTarget(event.text || "", state.currentTarget);
+    decidedThisTurn = true;
+    applyTarget(ctx, target, reason);
+  } else {
+    // Agent is busy: defer the decision to the next turn boundary.
+    pendingInputText = event.text || "";
+  }
+}
+
+// Per-turn failure tracking for escalation.
+function handleToolEnd(event: ToolExecutionEndEvent, ctx: ExtensionContext): void {
+  if (event.isError) {
+    state.totalFailures += 1;
+    state.consecutiveFailures += 1;
+    persistState();
+  } else {
+    // A success resets the failure streak regardless of mode.
+    if (state.consecutiveFailures > 0) {
+      state.consecutiveFailures = 0;
+      persistState();
+    }
+  }
+}
+
+// Session start: restore persisted routing state.
+function handleSessionStart(event: { reason: string }, ctx: ExtensionContext): void {
+  restoreStateFromSession(ctx);
+  showStatus(ctx);
+}
+
+/* =========================================================
+   SLASH COMMANDS
+========================================================= */
+
+function registerCommands(): void {
+  pi.registerCommand("auto", {
+    description: "Enable automatic model routing (Pi chooses LOCAL vs ASTRA)",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      await ctx.waitForIdle();
+      setMode("auto");
+      state.lastDecisionReason = "command /auto";
+      persistState();
+      showStatus(ctx);
+    },
+  });
+
+  pi.registerCommand("local", {
+    description: "Force LOCAL model (llama.cpp) and disable auto-routing",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      await ctx.waitForIdle();
+      if (!isTargetAvailable(ctx, "local")) {
+        (pi as unknown as {
+          sendMessage: (msg: unknown) => void;
+        }).sendMessage({
+          customType: DISPLAY_CUSTOM_TYPE,
+          content: "LOCAL provider/model not found in the model registry.",
+          display: true,
+        });
+        return;
+      }
+      setMode("local");
+      state.currentTarget = "local";
+      state.lastDecision = "local";
+      state.lastDecisionReason = "command /local";
+      applyingRouterModel = true;
+      pi.setModel(targetModel(ctx, "local")).catch(() => {
+        state.lastDecisionReason = "cannot switch to LOCAL: provider not configured";
+      });
+      setTimeout(() => {
+        applyingRouterModel = false;
+      }, 0);
+      persistState();
+      showStatus(ctx);
+    },
+  });
+
+  pi.registerCommand("astra", {
+    description: "Force REMOTE model and disable auto-routing",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      await ctx.waitForIdle();
+      if (!isTargetAvailable(ctx, "astra")) {
+        (pi as unknown as {
+          sendMessage: (msg: unknown) => void;
+        }).sendMessage({
+          customType: DISPLAY_CUSTOM_TYPE,
+          content: "ASTRA provider/model not found in the model registry.",
+          display: true,
+        });
+        return;
+      }
+      setMode("astra");
+      state.currentTarget = "astra";
+      state.lastDecision = "astra";
+      state.lastDecisionReason = "command /astra";
+      applyingRouterModel = true;
+      pi.setModel(targetModel(ctx, "astra")).catch(() => {
+        state.lastDecisionReason = "cannot switch to ASTRA: provider not configured";
+      });
+      setTimeout(() => {
+        applyingRouterModel = false;
+      }, 0);
+      persistState();
+      showStatus(ctx);
+    },
+  });
+
+  pi.registerCommand("router", {
+    description: "Show the current router state and last decision",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      await ctx.waitForIdle();
+      showStatus(ctx);
+    },
+  });
+}
+
+/* =========================================================
+   EXTENSION ENTRY POINT
+========================================================= */
+
+// The `pi` reference is captured here so handlers and commands can call action
+// methods (setModel, sendMessage, appendEntry). It is only valid after the
+// runner binds its context, which happens during factory execution.
+let pi: ExtensionAPI;
+
+export default function (extensionPi: ExtensionAPI): void {
+  pi = extensionPi;
+
+  // Register the virtual AUTO model so it appears in Pi's existing /model
+  // selector. `registerProvider` is queued at load and flushed once the model
+  // registry is available, so this is safe without a /reload.
+  //
+  // The model is inert: every selector interaction with it is intercepted by
+  // handleModelSelect and never results in a real provider request.
+  try {
+    pi.registerProvider(PROVIDER_AUTO, {
+      // CHANGE_ME: endpoint of your local llama.cpp server (default shown). The
+      // AUTO model itself is inert and never actually calls this URL, but the
+      // provider still needs a well-formed baseUrl to register.
+      baseUrl: "http://127.0.0.1:1234/v1",
+      api: "openai-completions" as const,
+      // Placeholder so the virtual AUTO provider appears in the /model selector.
+      apiKey: "auto-router",
+      models: [
+        {
+          id: MODEL_AUTO,
+          name: "AUTO",
+        },
+      ],
+    });
+  } catch {
+    /* provider may already be registered */
+  }
+
+  pi.on("model_select", handleModelSelect);
+  pi.on("turn_start", handleTurnStart);
+  pi.on("tool_execution_end", handleToolEnd);
+  pi.on("session_start", handleSessionStart);
+  pi.on("input", handleInput);
+
+  registerCommands();
+}

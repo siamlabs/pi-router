@@ -1,0 +1,9 @@
+{
+  "name": "pi-router",
+  "version": "1.0.0",
+  "description": "Automatic model routing (AUTO / LOCAL / ASTRA) for pi via the /model selector",
+  "main": "index.ts",
+  "pi": {
+    "extensions": ["index.ts"]
+  }
+}

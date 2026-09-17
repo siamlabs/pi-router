@@ -3,13 +3,9 @@
  *
  * Exposes three routing modes through Pi's existing `/model` selector:
  *
- *   AUTO   -> Pi decides between LOCAL and a REMOTE model, per turn, based on the task
- *   LOCAL  -> force provider=local  model=model  (a local llama.cpp server)
- *   REMOTE -> force provider=openai model=<your remote model>
- *
- * NOTE: this is a generic template. Before using it, set the REMOTE model name
- * and the local server endpoint in the CONSTANTS block below (search for
- * "CHANGE_ME").
+ *   AUTO   -> Pi decides between LOCAL and ASTRA, per turn, based on the task
+ *   LOCAL  -> force provider=local  model=model  (llama.cpp @ 127.0.0.1:1234/v1)
+ *   ASTRA  -> force provider=openai model=gpt-6-astra
  *
  * Routing happens entirely at the Pi extension layer. Pi's `/model` selector is
  * never replaced or hidden. AUTO is represented as a *virtual* model registered
@@ -27,7 +23,7 @@ import type {
   ExtensionContext,
   ExtensionCommandContext,
   ModelSelectEvent,
-  ToolExecutionEndEvent,
+  TurnEndEvent,
   TurnStartEvent,
   InputEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -38,10 +34,8 @@ import type {
 
 const PROVIDER_LOCAL = "local";
 const MODEL_LOCAL = "model";
-const PROVIDER_ASTRA = "openai";
-// CHANGE_ME: your OpenAI-compatible remote model. Replace with a model you have
-// configured in Pi (e.g. "gpt-4o"). This is the only per-user value that matters.
-const MODEL_ASTRA = "gpt-4o";
+const PROVIDER_REMOTE = "openai";
+const MODEL_REMOTE = "gpt-6-astra";
 
 // Virtual provider/model that stands in for the AUTO option inside the selector.
 const PROVIDER_AUTO = "auto-router";
@@ -61,6 +55,7 @@ interface RouterState {
   totalDecisions: number;
   totalSwitches: number;
   totalFailures: number;
+  lastFailure: string;
   lastDecision: string;
   lastDecisionReason: string;
   history: Array<{ ts: string; from: Target; to: Target; reason: string }>;
@@ -73,6 +68,7 @@ const DEFAULT_STATE: RouterState = {
   totalDecisions: 0,
   totalSwitches: 0,
   totalFailures: 0,
+  lastFailure: "",
   lastDecision: "",
   lastDecisionReason: "",
   history: [],
@@ -149,8 +145,8 @@ function recordSwitch(from: Target, to: Target, reason: string): void {
 function targetModel(ctx: ExtensionContext, target: Target): ReturnType<
   typeof ctx.modelRegistry.find
 > {
-  const provider = target === "astra" ? PROVIDER_ASTRA : PROVIDER_LOCAL;
-  const id = target === "astra" ? MODEL_ASTRA : MODEL_LOCAL;
+  const provider = target === "astra" ? PROVIDER_REMOTE : PROVIDER_LOCAL;
+  const id = target === "astra" ? MODEL_REMOTE : MODEL_LOCAL;
 
   const resolved = ctx.modelRegistry.find(provider, id);
   if (resolved) return resolved;
@@ -250,8 +246,11 @@ function classifyTask(text: string): {
 /**
  * AUTO policy: pick the target model for this turn.
  *
- * 1. If the previous turn failed (tool error) we escalate away from the model
- *    that just failed, unless it already succeeded at least once.
+ * 1. Escalate once `consecutiveFailures` reaches the threshold: switch away
+ *    from the model that just failed. The counter is only reset here (after an
+ *    escalation switch) and on a successful turn in `handleTurnEnd` — it is
+ *    deliberately NOT reset by `applyTarget`, so it survives the per-turn
+ *    decide/switch and can actually reach the threshold.
  * 2. Otherwise classify the incoming task text and route accordingly.
  * 3. Ties / no signal fall back to the previous target, else local.
  */
@@ -323,7 +322,6 @@ function applyTarget(
   state.lastDecision = target;
   state.lastDecisionReason = reason;
   state.totalDecisions += 1;
-  state.consecutiveFailures = 0;
   recordSwitch(prev, target, reason);
 
   // Release the guard once the deferred setModel has been scheduled.
@@ -379,7 +377,9 @@ function buildStatusLine(): string {
     `Router: **${mode}** → ${target}  ` +
     `(decisions ${state.totalDecisions}, switches ${state.totalSwitches}, ` +
     `failures ${state.totalFailures}, last: ${state.lastDecision || "none"} ` +
-    `${state.lastDecisionReason || ""})`
+    `${state.lastDecisionReason || ""}` +
+    (state.lastFailure ? ` | last-failure: ${state.lastFailure}` : "") +
+    `)`
   );
 }
 
@@ -430,7 +430,7 @@ function handleModelSelect(event: ModelSelectEvent, ctx: ExtensionContext): void
   }
 
   // Explicit ASTRA force.
-  if (model.provider === PROVIDER_ASTRA && model.id === MODEL_ASTRA) {
+  if (model.provider === PROVIDER_REMOTE && model.id === MODEL_REMOTE) {
     setMode("astra");
     state.currentTarget = "astra";
     state.lastDecision = "astra";
@@ -473,18 +473,27 @@ function handleInput(event: InputEvent, ctx: ExtensionContext): void {
   }
 }
 
-// Per-turn failure tracking for escalation.
-function handleToolEnd(event: ToolExecutionEndEvent, ctx: ExtensionContext): void {
-  if (event.isError) {
+// Per-turn outcome tracking for escalation.
+//
+// `turn_end` fires on EVERY turn — success and failure alike — carrying the
+// final assistant message. On a provider/request failure (e.g. "no credits
+// remaining" -> HTTP 402) the OpenAI SDK throws before any tool runs, so the
+// tool_execution_end event never fires and the failure would otherwise go
+// completely undetected. Inspecting `message.stopReason` here catches both
+// provider failures AND tool errors from a single, reliable event.
+function handleTurnEnd(event: TurnEndEvent): void {
+  const msg = event?.message;
+  // Only a real "error" counts toward escalation. An aborted turn (user
+  // cancels) is not a provider failure and must not escalate the router.
+  if (msg && msg.stopReason === "error") {
     state.totalFailures += 1;
     state.consecutiveFailures += 1;
+    state.lastFailure = msg.errorMessage || `${msg.stopReason} during turn`;
     persistState();
-  } else {
-    // A success resets the failure streak regardless of mode.
-    if (state.consecutiveFailures > 0) {
-      state.consecutiveFailures = 0;
-      persistState();
-    }
+  } else if (state.consecutiveFailures > 0) {
+    // A successful turn resets the failure streak regardless of mode.
+    state.consecutiveFailures = 0;
+    persistState();
   }
 }
 
@@ -541,7 +550,7 @@ function registerCommands(): void {
   });
 
   pi.registerCommand("astra", {
-    description: "Force REMOTE model and disable auto-routing",
+    description: "Force ASTRA model (openai gpt-6-astra) and disable auto-routing",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       await ctx.waitForIdle();
       if (!isTargetAvailable(ctx, "astra")) {
@@ -599,12 +608,8 @@ export default function (extensionPi: ExtensionAPI): void {
   // handleModelSelect and never results in a real provider request.
   try {
     pi.registerProvider(PROVIDER_AUTO, {
-      // CHANGE_ME: endpoint of your local llama.cpp server (default shown). The
-      // AUTO model itself is inert and never actually calls this URL, but the
-      // provider still needs a well-formed baseUrl to register.
       baseUrl: "http://127.0.0.1:1234/v1",
       api: "openai-completions" as const,
-      // Placeholder so the virtual AUTO provider appears in the /model selector.
       apiKey: "auto-router",
       models: [
         {
@@ -619,7 +624,7 @@ export default function (extensionPi: ExtensionAPI): void {
 
   pi.on("model_select", handleModelSelect);
   pi.on("turn_start", handleTurnStart);
-  pi.on("tool_execution_end", handleToolEnd);
+  pi.on("turn_end", handleTurnEnd);
   pi.on("session_start", handleSessionStart);
   pi.on("input", handleInput);
 

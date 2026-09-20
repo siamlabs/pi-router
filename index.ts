@@ -26,6 +26,7 @@ import type {
   TurnEndEvent,
   TurnStartEvent,
   InputEvent,
+  AgentMessage,
 } from "@earendil-works/pi-coding-agent";
 
 /* =========================================================
@@ -34,8 +35,8 @@ import type {
 
 const PROVIDER_LOCAL = "local";
 const MODEL_LOCAL = "model";
-const PROVIDER_REMOTE = "openai";
-const MODEL_REMOTE = "gpt-6-astra";
+const PROVIDER_ASTRA = "openai";
+const MODEL_ASTRA = "gpt-6-astra";
 
 // Virtual provider/model that stands in for the AUTO option inside the selector.
 const PROVIDER_AUTO = "auto-router";
@@ -145,8 +146,8 @@ function recordSwitch(from: Target, to: Target, reason: string): void {
 function targetModel(ctx: ExtensionContext, target: Target): ReturnType<
   typeof ctx.modelRegistry.find
 > {
-  const provider = target === "astra" ? PROVIDER_REMOTE : PROVIDER_LOCAL;
-  const id = target === "astra" ? MODEL_REMOTE : MODEL_LOCAL;
+  const provider = target === "astra" ? PROVIDER_ASTRA : PROVIDER_LOCAL;
+  const id = target === "astra" ? MODEL_ASTRA : MODEL_LOCAL;
 
   const resolved = ctx.modelRegistry.find(provider, id);
   if (resolved) return resolved;
@@ -246,7 +247,7 @@ function classifyTask(text: string): {
 /**
  * AUTO policy: pick the target model for this turn.
  *
- * 1. Escalate once `consecutiveFailures` reaches the threshold: switch away
+ * 1. Escalate once `consecutiveFailures` reaches the threshold (3): switch away
  *    from the model that just failed. The counter is only reset here (after an
  *    escalation switch) and on a successful turn in `handleTurnEnd` — it is
  *    deliberately NOT reset by `applyTarget`, so it survives the per-turn
@@ -259,7 +260,7 @@ function decideTarget(
   prevTarget: Target
 ): { target: Target; reason: string } {
   // 1. Escalate on failure: switch away from the model that just failed.
-  if (state.consecutiveFailures >= 2) {
+  if (state.consecutiveFailures >= 3) {
     const next =
       prevTarget === "local"
         ? "astra"
@@ -270,7 +271,7 @@ function decideTarget(
     state.consecutiveFailures = 0;
     return {
       target: next,
-      reason: `escalated after ${failures} consecutive tool failures`,
+      reason: `escalated after ${failures} consecutive failures`,
     };
   }
 
@@ -299,35 +300,43 @@ function setMode(mode: Mode): void {
 
 /**
  * Apply a routing decision by switching the active model through Pi's own
- * setModel(). We defer with setTimeout(0) so it runs *after* the current
- * model_select "set" event has fully unwound, then mark the guard so the
- * resulting "set" event is ignored.
+ * setModel(). We await the switch and only commit the routing state after it
+ * completes successfully, so a failed switch is never reported as a success.
+ * The resulting "set" model_select event is ignored via the applyingRouterModel
+ * guard.
  */
-function applyTarget(
+async function applyTarget(
   ctx: ExtensionContext,
   target: Target,
   reason: string
-): void {
+): Promise<void> {
   if (!target) return;
 
   applyingRouterModel = true;
   const prev = state.currentTarget;
-  (pi as unknown as {
-    setModel: (m: unknown) => Promise<boolean>;
-  }).setModel(targetModel(ctx, target)).catch(() => {
+  try {
+    await (pi as unknown as {
+      setModel: (m: unknown) => Promise<boolean>;
+    }).setModel(targetModel(ctx, target));
+  } catch (err) {
+    // On failure, do not pretend the switch succeeded: record the failure
+    // reason and leave state.currentTarget pointing at the still-active model.
     state.lastDecisionReason = `cannot switch to ${target}: provider not configured`;
-  });
+    state.lastFailure = (err as Error)?.message || "setModel failed";
+    persistState();
+    return;
+  } finally {
+    // Always release the guard once setModel() has settled.
+    applyingRouterModel = false;
+  }
 
+  // Only reached on successful completion.
   state.currentTarget = target;
   state.lastDecision = target;
   state.lastDecisionReason = reason;
   state.totalDecisions += 1;
   recordSwitch(prev, target, reason);
-
-  // Release the guard once the deferred setModel has been scheduled.
-  setTimeout(() => {
-    applyingRouterModel = false;
-  }, 0);
+  persistState();
 }
 
 /* =========================================================
@@ -430,7 +439,7 @@ function handleModelSelect(event: ModelSelectEvent, ctx: ExtensionContext): void
   }
 
   // Explicit ASTRA force.
-  if (model.provider === PROVIDER_REMOTE && model.id === MODEL_REMOTE) {
+  if (model.provider === PROVIDER_ASTRA && model.id === MODEL_ASTRA) {
     setMode("astra");
     state.currentTarget = "astra";
     state.lastDecision = "astra";
@@ -453,7 +462,7 @@ function handleTurnStart(_event: TurnStartEvent, ctx: ExtensionContext): void {
   const { target, reason } = decideTarget(pendingInputText, state.currentTarget);
   pendingInputText = "";
   decidedThisTurn = true;
-  applyTarget(ctx, target, reason);
+  void applyTarget(ctx, target, reason);
 }
 
 // User submitted input. This is where we have the task text, so for AUTO mode
@@ -466,7 +475,7 @@ function handleInput(event: InputEvent, ctx: ExtensionContext): void {
   if (ctx.isIdle()) {
     const { target, reason } = decideTarget(event.text || "", state.currentTarget);
     decidedThisTurn = true;
-    applyTarget(ctx, target, reason);
+    void applyTarget(ctx, target, reason);
   } else {
     // Agent is busy: defer the decision to the next turn boundary.
     pendingInputText = event.text || "";
@@ -486,6 +495,14 @@ function handleTurnEnd(event: TurnEndEvent): void {
   // Only a real "error" counts toward escalation. An aborted turn (user
   // cancels) is not a provider failure and must not escalate the router.
   if (msg && msg.stopReason === "error") {
+    // A context-window overflow (e.g. local llama.cpp: "68820 tokens exceeds
+    // the available context size 65536") is NOT a routing failure — it is a
+    // property of the current conversation, not the provider. It is therefore
+    // neutral for escalation: it neither advances the failure streak nor
+    // resets it. Escalating away would just move the same oversized context to
+    // another model, so we let the turn simply not count.
+    if (isContextWindowError(msg)) return;
+
     state.totalFailures += 1;
     state.consecutiveFailures += 1;
     state.lastFailure = msg.errorMessage || `${msg.stopReason} during turn`;
@@ -495,6 +512,26 @@ function handleTurnEnd(event: TurnEndEvent): void {
     state.consecutiveFailures = 0;
     persistState();
   }
+}
+
+// Context-window overflow detection.
+//
+// Local llama.cpp reports an oversized conversation as an "error" stopReason
+// with a message like:
+//   "400 request (68820 tokens) exceeds the available context size (65536 tokens)"
+// We match a small set of case-insensitive substrings so such an error is not
+// mistaken for a provider/credit failure.
+function isContextWindowError(msg: AgentMessage): boolean {
+  const text = (msg.errorMessage || msg.stopReason || "").toLowerCase();
+  return (
+    text.includes("context size") ||
+    text.includes("context window") ||
+    text.includes("context length") ||
+    text.includes("exceeds the available context") ||
+    text.includes("maximum context") ||
+    text.includes("too many tokens") ||
+    text.includes("token limit")
+  );
 }
 
 // Session start: restore persisted routing state.
@@ -534,16 +571,20 @@ function registerCommands(): void {
         return;
       }
       setMode("local");
-      state.currentTarget = "local";
-      state.lastDecision = "local";
-      state.lastDecisionReason = "command /local";
-      applyingRouterModel = true;
-      pi.setModel(targetModel(ctx, "local")).catch(() => {
-        state.lastDecisionReason = "cannot switch to LOCAL: provider not configured";
-      });
-      setTimeout(() => {
-        applyingRouterModel = false;
-      }, 0);
+      // Await the switch so we can report a failed switch before committing.
+      await applyTarget(ctx, "local", "command /local");
+      // If the switch failed, applyTarget recorded the failure reason; surface
+      // it so the user knows the model did not actually change.
+      if (state.lastDecisionReason.startsWith("cannot switch to LOCAL")) {
+        (pi as unknown as {
+          sendMessage: (msg: unknown) => void;
+        }).sendMessage({
+          customType: DISPLAY_CUSTOM_TYPE,
+          content: state.lastDecisionReason,
+          display: true,
+        });
+        return;
+      }
       persistState();
       showStatus(ctx);
     },
@@ -564,16 +605,20 @@ function registerCommands(): void {
         return;
       }
       setMode("astra");
-      state.currentTarget = "astra";
-      state.lastDecision = "astra";
-      state.lastDecisionReason = "command /astra";
-      applyingRouterModel = true;
-      pi.setModel(targetModel(ctx, "astra")).catch(() => {
-        state.lastDecisionReason = "cannot switch to ASTRA: provider not configured";
-      });
-      setTimeout(() => {
-        applyingRouterModel = false;
-      }, 0);
+      // Await the switch so we can report a failed switch before committing.
+      await applyTarget(ctx, "astra", "command /astra");
+      // If the switch failed, applyTarget recorded the failure reason; surface
+      // it so the user knows the model did not actually change.
+      if (state.lastDecisionReason.startsWith("cannot switch to ASTRA")) {
+        (pi as unknown as {
+          sendMessage: (msg: unknown) => void;
+        }).sendMessage({
+          customType: DISPLAY_CUSTOM_TYPE,
+          content: state.lastDecisionReason,
+          display: true,
+        });
+        return;
+      }
       persistState();
       showStatus(ctx);
     },

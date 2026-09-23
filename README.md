@@ -372,7 +372,6 @@ API key: <your own API key>
 Model: gpt-6-astra
 ```
 
-**Never hard-code your API key into the `pi-router` repository or commit it to GitHub.**
 
 If your Pi configuration uses a different provider or model identifier, configure the provider in Pi and update the router's ASTRA model identifier accordingly.
 

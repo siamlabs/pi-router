@@ -1,35 +1,21 @@
 ![pi-router](./pi-router.jpg)
-# pi-router
+#pi-router
 
-Automatic model routing for [Pi](https://github.com/badlogic/pi-mono) through a lightweight Pi extension.
+Automatic model routing for Pi through a lightweight Pi extension.
 
-`pi-router` lets you use a **LOCAL model**, an **ASTRA model**, or let Pi **automatically choose between them per turn**.
+pi-router lets you use a LOCAL model, an ASTRA model, or let Pi automatically choose between them per turn.
 
-It works through Pi's existing `/model` selector and does not replace or hide it.
-
-<p align="center">
-  <img src="./pi-router.jpg" alt="pi-router">
-</p>
+It works through Pi's existing /model selector and does not replace or hide it.
 
 <div style="background-color: white; padding: 16px; border-radius: 8px; color: black;">
 
 <strong>Experimental / Personal Project</strong>
 
-<p>
-<code>pi-router</code> is an experimental project that was originally developed
-for personal use and is now being shared publicly in case it is useful to others.
-</p>
+<p> <code>pi-router</code> is an experimental project that was originally developed for personal use and is now being shared publicly in case it is useful to others. </p>
 
-<p>
-The project may change significantly over time and may not cover every use case
-or environment. You are free to fork it, modify it, extend it, or adapt it to
-your own requirements.
-</p>
+<p> The project may change significantly over time and may not cover every use case or environment. You are free to fork it, modify it, extend it, or adapt it to your own requirements. </p>
 
-<p>
-Use it as a starting point and make whatever changes are appropriate for your
-own setup and workflow.
-</p>
+<p> Use it as a starting point and make whatever changes are appropriate for your own setup and workflow. </p>
 
 </div>
 

@@ -28,6 +28,14 @@ import type {
   InputEvent,
   AgentMessage,
 } from "@earendil-works/pi-coding-agent";
+import {
+  buildRoutingSnapshot,
+  policyEngine,
+  getVonDecision,
+  getVonConfig,
+  setVonConfigForTests,
+  loadVonConfig,
+} from "./von.ts";
 
 /* =========================================================
    CONSTANTS
@@ -60,6 +68,16 @@ interface RouterState {
   lastDecision: string;
   lastDecisionReason: string;
   history: Array<{ ts: string; from: Target; to: Target; reason: string }>;
+  // ---- Routing-snapshot fields (used to build the compact Von request) ----
+  // These are derived from, and augment, the deterministic state above; they do
+  // NOT replace it. Every field has a safe default so an absent value never
+  // breaks routing.
+  attempts: number; // model-generation attempts in the current phase
+  toolErrors: number; // repeated tool errors so far
+  testFailures: number; // persistent test failures so far
+  filesChanged: number; // files written in the current phase
+  securitySensitive: boolean; // security-sensitive work detected
+  lastDecisionReasonVon: string; // last Von/policy rationale (status line)
 }
 
 const DEFAULT_STATE: RouterState = {
@@ -73,6 +91,12 @@ const DEFAULT_STATE: RouterState = {
   lastDecision: "",
   lastDecisionReason: "",
   history: [],
+  attempts: 0,
+  toolErrors: 0,
+  testFailures: 0,
+  filesChanged: 0,
+  securitySensitive: false,
+  lastDecisionReasonVon: "",
 };
 
 /* =========================================================
@@ -80,6 +104,28 @@ const DEFAULT_STATE: RouterState = {
 ========================================================= */
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+
+/* =========================================================
+   VON (AUTO mode only)
+========================================================= */
+
+// Von is an independent local HTTP service. pi-router is only its client.
+// Configuration comes from the router's normal config mechanism (compiled-in
+// defaults, overridable by von.config.json). Von is DISABLED by default, so the
+// existing deterministic policy is unchanged until it is explicitly enabled —
+// this keeps manual LOCAL/ASTRA and the fallback behavior safe out of the box.
+if (loadVonConfig().enabled) {
+  // Enable at import time only if the config explicitly turned it on. This pins
+  // the live config in the von module so the router and the von adapter agree.
+  setVonConfigForTests(loadVonConfig());
+}
+
+// Signature of the routing state last sent to Von (gating). Von is only called
+// when the routing state has *materially* changed since the last evaluation.
+let routingSignatureCache = "";
+// The last target Von (via the policy engine) resolved to, so an unchanged
+// signature can reuse the decision instead of re-calling Von.
+let lastVonTarget: Target = null;
 
 /* =========================================================
    STATE
@@ -231,6 +277,30 @@ const IMPLEMENTATION_HINTS = [
   "update a ",
 ];
 
+// Failure-classification hints for the routing snapshot. Used only to populate
+// the diagnostic counters (testFailures / toolErrors) sent to Von; they do not
+// affect the deterministic escalation path.
+const TEST_FAILURE_HINTS = [
+  "test",
+  "tests",
+  "failing",
+  "assertion",
+  "assert failed",
+  "expected",
+  "snapshot mismatch",
+  "jest",
+  "vitest",
+  "pytest",
+];
+const TOOL_ERROR_HINTS = [
+  "tool",
+  "tool_error",
+  "tool call",
+  "tool call failed",
+  "function call",
+  "tool execution",
+];
+
 function classifyTask(text: string): {
   score: number;
   architecture: number;
@@ -254,12 +324,17 @@ function classifyTask(text: string): {
  *    decide/switch and can actually reach the threshold.
  * 2. Otherwise classify the incoming task text and route accordingly.
  * 3. Ties / no signal fall back to the previous target, else local.
+ *
+ * Precedence with Von: deterministic escalation (1) overrides Von; Von (2) is
+ * the semantic signal for AUTO and is optional — any Von failure falls through
+ * to keyword classify (3).
  */
-function decideTarget(
+async function decideTarget(
   text: string,
   prevTarget: Target
-): { target: Target; reason: string } {
-  // 1. Escalate on failure: switch away from the model that just failed.
+): Promise<{ target: Target; reason: string }> {
+  // 1. Deterministic hard escalation — overrides Von when the existing policy
+  //    clearly indicates escalation.
   if (state.consecutiveFailures >= 3) {
     const next =
       prevTarget === "local"
@@ -275,15 +350,127 @@ function decideTarget(
     };
   }
 
-  const { score } = classifyTask(text);
+  // 2. Von (AUTO only). Optional; returns null on any failure so we fall through.
+  const vonResult = await vonDecision(text);
+  if (vonResult) return vonResult;
 
-  // 2. Clear signal.
+  // 3. Keyword classify (existing policy, unchanged).
+  const { score } = classifyTask(text);
   if (score >= 1) return { target: "astra", reason: "architecture/design signals" };
   if (score <= -1) return { target: "local", reason: "implementation signals" };
-
-  // 3. No signal: keep prior target; else prefer local.
   if (prevTarget) return { target: prevTarget, reason: "no signal; kept prior target" };
   return { target: "local", reason: "no signal; default local" };
+}
+
+/* =========================================================
+   VON (AUTO only) — evaluation-point gating + policy
+========================================================= */
+
+// Security-sensitive keywords. When present in the task we flag it so Von sees a
+// strong escalation signal. Derived from the task text (no second state system).
+const SECURITY_HINTS = [
+  "security",
+  "vuln",
+  "vulnerability",
+  "auth",
+  "authorization",
+  "permission",
+  "privilege",
+  "crypto",
+  "cryptography",
+  "cve",
+  "exploit",
+  "injection",
+  "sandbox",
+  "isolation",
+];
+
+function isSecuritySensitive(text: string): boolean {
+  const lower = ` ${text.toLowerCase()} `;
+  return SECURITY_HINTS.some((h) => lower.includes(` ${h} `));
+}
+
+/**
+ * Gating signature: the routing INPUT signals that matter for deciding whether
+ * Von should be re-evaluated. The current model (currentTarget) is deliberately
+ * excluded — it is the OUTPUT of routing, not an independent signal, so its
+ * change must not itself force a fresh Von call. The truncated task is included
+ * so re-evaluating the same task with unchanged state reuses the decision.
+ */
+function routingSignature(task: string): string {
+  return [
+    isSecuritySensitive(task) ? "sec" : "",
+    state.consecutiveFailures, // failure streak flips phase -> material change
+    state.toolErrors,
+    state.testFailures,
+    state.filesChanged,
+    (task || "").trim().toLowerCase().slice(0, 200),
+  ].join("|");
+}
+
+/**
+ * The Von evaluation point. Called from decideTarget for AUTO only.
+ *
+ *   - Von disabled  -> null (pure fallback to keyword policy).
+ *   - Routing state unchanged since last evaluation -> reuse last target.
+ *   - Otherwise -> call Von, apply the policy engine, return a target.
+ *
+ * Returns null whenever Von cannot produce a decision (disabled, unavailable,
+ * malformed) so decideTarget falls through to the existing keyword policy.
+ */
+async function vonDecision(text: string): Promise<{ target: Target; reason: string } | null> {
+  if (!getVonConfig().enabled) return null;
+
+  const sig = routingSignature(text);
+  if (sig !== routingSignatureCache) {
+    routingSignatureCache = sig;
+    return evaluateVon(text);
+  }
+  // No material change since the last evaluation -> reuse the last decision.
+  if (lastVonTarget) {
+    return {
+      target: lastVonTarget,
+      reason: state.lastDecisionReasonVon || "von: reused decision (routing state unchanged)",
+    };
+  }
+  return null;
+}
+
+/**
+ * Build the compact snapshot, call Von, and apply the local-first policy. Any
+ * failure yields null so the router falls back to the keyword policy.
+ */
+async function evaluateVon(text: string): Promise<{ target: Target; reason: string } | null> {
+  try {
+    // Flag security-sensitive work so Von sees it as a strong escalation signal.
+    if (isSecuritySensitive(text)) state.securitySensitive = true;
+
+    const snapshot = buildRoutingSnapshot(
+      {
+        consecutiveFailures: state.consecutiveFailures,
+        attempts: state.attempts,
+        toolErrors: state.toolErrors,
+        testFailures: state.testFailures,
+        filesChanged: state.filesChanged,
+        securitySensitive: state.securitySensitive,
+        currentTarget: state.currentTarget,
+      },
+      text
+    );
+
+    const von = await getVonDecision(snapshot);
+    if (von === null) return null; // unavailable / malformed -> keyword fallback
+
+    const outcome = policyEngine(von, {
+      clearAstraThreshold: getVonConfig().clearAstraThreshold,
+    });
+    state.lastDecisionReasonVon = outcome.reason;
+    lastVonTarget = outcome.decision === "ASTRA" ? "astra" : "local";
+    return { target: lastVonTarget, reason: outcome.reason };
+  } catch {
+    // Von must never crash Pi.
+    return null;
+  }
 }
 
 /* =========================================================
@@ -454,12 +641,15 @@ function handleModelSelect(event: ModelSelectEvent, ctx: ExtensionContext): void
 // Turn boundary: reset the per-turn decision flag so the next input re-decides,
 // and drive the decision if the input event fired while the agent was busy
 // (so the switch lands before the first provider request of the turn).
-function handleTurnStart(_event: TurnStartEvent, ctx: ExtensionContext): void {
+async function handleTurnStart(_event: TurnStartEvent, ctx: ExtensionContext): Promise<void> {
   decidedThisTurn = false;
+  // New turn boundary => a fresh model-generation attempt (routing snapshot signal).
+  state.attempts += 1;
   if (state.mode !== "auto") return;
   if (decidedThisTurn) return;
   if (!pendingInputText && state.currentTarget) return; // already decided
-  const { target, reason } = decideTarget(pendingInputText, state.currentTarget);
+  // Von is async, so await the decision before committing the switch.
+  const { target, reason } = await decideTarget(pendingInputText, state.currentTarget);
   pendingInputText = "";
   decidedThisTurn = true;
   void applyTarget(ctx, target, reason);
@@ -468,12 +658,13 @@ function handleTurnStart(_event: TurnStartEvent, ctx: ExtensionContext): void {
 // User submitted input. This is where we have the task text, so for AUTO mode
 // we decide + switch here if the agent is idle (so the switch is not torn down
 // mid-stream).
-function handleInput(event: InputEvent, ctx: ExtensionContext): void {
+async function handleInput(event: InputEvent, ctx: ExtensionContext): Promise<void> {
   if (state.mode !== "auto") return;
   if (decidedThisTurn) return; // already decided for this turn
 
   if (ctx.isIdle()) {
-    const { target, reason } = decideTarget(event.text || "", state.currentTarget);
+    // Von is async, so await the decision before committing the switch.
+    const { target, reason } = await decideTarget(event.text || "", state.currentTarget);
     decidedThisTurn = true;
     void applyTarget(ctx, target, reason);
   } else {
@@ -506,6 +697,18 @@ function handleTurnEnd(event: TurnEndEvent): void {
     state.totalFailures += 1;
     state.consecutiveFailures += 1;
     state.lastFailure = msg.errorMessage || `${msg.stopReason} during turn`;
+    // Classify the failure into the routing-snapshot counters. These are
+    // diagnostic signals for Von; they never change the deterministic escalation
+    // path above. A persistent test failure and a repeated tool error are both
+    // "the model is misbehaving" signals, but they are tracked separately so Von
+    // can react to them distinctly.
+    const why = (msg.errorMessage || msg.stopReason || "").toLowerCase();
+    if (TEST_FAILURE_HINTS.some((h) => why.includes(h))) {
+      state.testFailures += 1;
+    }
+    if (TOOL_ERROR_HINTS.some((h) => why.includes(h))) {
+      state.toolErrors += 1;
+    }
     persistState();
   } else if (state.consecutiveFailures > 0) {
     // A successful turn resets the failure streak regardless of mode.

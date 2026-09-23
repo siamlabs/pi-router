@@ -1,5 +1,13 @@
 ![pi-router](./pi-router.jpg)
-Pi-router
+#pi-router
+
+Automatic model routing for Pi through a lightweight Pi extension.
+
+pi-router lets you use a LOCAL model, an ASTRA model, or let Pi automatically choose between them per turn.
+
+It works through Pi's existing /model selector and does not replace or hide it.
+
+
 
 > **Experimental / Personal Project**
 >

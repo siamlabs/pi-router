@@ -1,3 +1,4 @@
+![pi-router](./pi-router.jpg)
 # pi-router
 
 Automatic model routing for [Pi](https://github.com/badlogic/pi-mono) through a lightweight Pi extension.
